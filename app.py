@@ -12,6 +12,7 @@ from langchain_anthropic import ChatAnthropic
 from backtester import BacktestRunner
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
+from flask_cors import CORS
 
 import boto3
 import pandas as pd
@@ -26,6 +27,7 @@ import threading
 dotenv.load_dotenv()    
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})  # Enable CORS for all routes
 
 # Initialize Supabase client and S3 client
 supabase = create_client(AppConfig.SUPABASE_URL, AppConfig.SUPABASE_KEY)
@@ -498,87 +500,143 @@ def generate_backtest_summary(backtest_results):
     return chain.run(backtest_results=json.loads(backtest_results.to_json()))
 
 
-def stream_chat_with_llm(chat_message, chat_history, conversation_id):
-    """
-    Simulate a streaming response by chunking the final output.
-    (Replace this with your LLM's native streaming if available.)
-    """
-    # Use your existing synchronous call to get the full answer.
-    result = chat_with_llm(chat_message, chat_history, conversation_id)
-    # For example, split into 20-character chunks.
-    chunk_size = 20
-    for i in range(0, len(result), chunk_size):
-        yield result[i: i + chunk_size]
-
-class StreamingCallbackHandler(BaseCallbackHandler):
-    """
-    A custom callback handler that uses a thread-safe queue to stream tokens.
-    """
-    def __init__(self):
-        self.queue = queue.Queue()
-
-    def on_llm_new_token(self, token: str, **kwargs):
-        self.queue.put(token)
-
-    def on_llm_end(self, response, **kwargs):
-        # Signal the end of the stream by putting a None token.
-        self.queue.put(None)
-
 def stream_llm_response(prompt_template, input_vars, chain_kwargs):
     """
-    Helper that creates an LLMChain with streaming enabled and yields tokens as they are generated.
+    Helper that creates an LLMChain and returns the complete response as text.
     """
-    handler = StreamingCallbackHandler()
     llm = ChatAnthropic(
         api_key=AppConfig.ANTHROPIC_API_KEY,
-        model="claude-3-5-haiku-20241022",
-        streaming=True,
-        callbacks=[handler]
+        model="claude-3-5-haiku-20241022"
     )
     prompt = PromptTemplate(input_variables=list(input_vars.keys()), template=prompt_template)
     chain = LLMChain(llm=llm, prompt=prompt)
     
-    def run_chain():
-        chain.run(**chain_kwargs)
-    thread = threading.Thread(target=run_chain)
-    thread.start()
+    # Get the complete response
+    response = chain.run(**chain_kwargs)
     
-    while True:
-        token = handler.queue.get()
-        if token is None:
-            break
-        yield token
-    thread.join()
+    # Return the response as a single SSE message
+    yield f"data: {json.dumps({'choices': [{'delta': {'content': response}, 'finish_reason': 'stop'}]})}\n\n"
 
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
+    print("\n=== Starting Chat Request ===")
     data = request.get_json()
-    chat_message = data.get('chat_message')
-    chat_history = data.get('chat_history', [])
-    conversation_id = data.get('conversation_id', None)
-
+    print(f"Received request data: {json.dumps(data, indent=2)}")
+    
+    # Extract messages from the request body
+    messages = data.get('messages', [])
+    conversation_id = data.get('id')
+    print(f"Conversation ID: {conversation_id}")
+    print(f"Number of messages: {len(messages)}")
+    
+    if not messages:
+        print("Error: No messages provided")
+        return Response("No messages provided\n\n", mimetype='text/event-stream')
+        
+    # Get the last message from the conversation
+    last_message = messages[-1]
+    chat_message = last_message.get('content', '')
+    print(f"Last message content: {chat_message}")
+    
+    # Convert messages to chat history format
+    chat_history = [msg.get('content', '') for msg in messages[:-1]]  # Exclude the last message
+    print(f"Chat history length: {len(chat_history)}")
+    print(f"Chat history: {json.dumps(chat_history, indent=2)}")
+    
     if not chat_message:
-        return jsonify({"error": "No chat message provided"}), 400
+        print("Error: No chat message content found")
+        return Response("No chat message provided\n\n", mimetype='text/event-stream')
 
+    print("\n=== Analyzing Intent ===")
     intent = analyze_intent(chat_message, chat_history)
+    print(f"Detected intent: {intent}")
 
-    if intent == 'backtest':
-        result, images = run_backtest_command(chat_message, chat_history, conversation_id)
-        res = upload_backtest_result(result, images, conversation_id)
-        if res:
-            summary = generate_backtest_summary(result)
-            response = {"type": "backtest", "result": summary}
+    def generate():
+        if intent == 'backtest':
+            print("\n=== Processing Backtest Request ===")
+            print("Running backtest command...")
+            result, images = run_backtest_command(chat_message, chat_history, conversation_id)
+            print("Backtest completed, uploading results...")
+            res = upload_backtest_result(result, images, conversation_id)
+            print(f"Upload result: {res}")
+            
+            if res:
+                print("Generating backtest summary...")
+                summary = generate_backtest_summary(result)
+                # Stream the response in chunks
+                yield f"{summary}\n\n"
+            else:
+                error_msg = "Failed to upload backtest result"
+                yield f"{error_msg}\n\n"
+                
+        elif intent == 'question':
+            print("\n=== Processing Backtest Question ===")
+            print(f"Fetching backtest results for conversation ID: {conversation_id}")
+            response = supabase.table("backtest_results").select("*").eq("conversation_id", conversation_id).execute()
+            if not response.data:
+                error_msg = f"No backtest results found for conversation ID {conversation_id}"
+                yield f"{error_msg}\n\n"
+                return
+                
+            backtest_result = response.data[0]
+            print("Found backtest results, preparing details...")
+            details = (
+                f"Results: {backtest_result.get('results')}\n"
+                f"Equity Curve: {backtest_result.get('equity_curve')}\n"
+                f"Trades: {backtest_result.get('trades')}\n"
+                f"Images: {json.dumps(backtest_result.get('images', {}))}\n"
+            )
+            
+            # Generate answer using LLM
+            prompt_template = """
+            You are an expert in quantitative finance and trading strategy backtesting.
+            Below are the detailed results of a backtest:
+            {backtest_details}
+
+            Based on the above information, please answer the following question:
+            {chat_message}
+            
+            Provide a clear and concise answer that refers to performance metrics, trade details, or equity curve insights as appropriate.
+            """
+            
+            llm = ChatAnthropic(api_key=AppConfig.ANTHROPIC_API_KEY, model="claude-3-5-haiku-20241022")
+            prompt = PromptTemplate(
+                input_variables=["backtest_details", "chat_message"],
+                template=prompt_template
+            )
+            chain = LLMChain(llm=llm, prompt=prompt)
+            
+            answer = chain.run(backtest_details=details, chat_message=chat_message)
+            yield f"{answer}\n\n"
+            
         else:
-            response = {"type": "error", "result": "Failed to upload backtest result"}
-    elif intent == 'question':
-        result = answer_backtest_question(chat_message, chat_history, conversation_id)
-        response = {"type": "question", "result": result}
-    else:
-        # Default to a conversational reply
-        result = chat_with_llm(chat_message, chat_history)
-        response = {"type": "conversation", "result": result}
+            print("\n=== Processing General Conversation ===")
+            prompt_template = """
+            You are a friendly, knowledgeable chatbot with expertise in quantitative finance and backtesting.
+            You are having a natural, engaging conversation with a user.
 
-    return jsonify(response)
+            Conversation ID: {conversation_id}
+            Chat History: {chat_history}
+            User: {chat_message}
+
+            Please provide a helpful and clear response in plain text.
+            """
+            
+            llm = ChatAnthropic(api_key=AppConfig.ANTHROPIC_API_KEY, model="claude-3-5-haiku-20241022")
+            prompt = PromptTemplate(
+                input_variables=["conversation_id", "chat_history", "chat_message"],
+                template=prompt_template
+            )
+            chain = LLMChain(llm=llm, prompt=prompt)
+            
+            answer = chain.run(
+                conversation_id=conversation_id,
+                chat_history=chat_history,
+                chat_message=chat_message
+            )
+            yield f"{answer}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/backtest-results/<conversation_id>', methods=['GET'])
 def get_backtest_results(conversation_id):
@@ -615,21 +673,48 @@ def get_backtest_results(conversation_id):
 @app.route('/chat/stream', methods=['POST'])
 def chat_stream_endpoint():
     """New streaming endpoint that mirrors the functionality of /chat but streams the response"""
+    print("\n=== Starting Chat Stream Request ===")
     data = request.get_json()
-    chat_message = data.get('chat_message')
-    chat_history = data.get('chat_history', [])
-    conversation_id = data.get('conversation_id', None)
-
+    print(f"Received request data: {json.dumps(data, indent=2)}")
+    
+    # Extract messages from the request body
+    messages = data.get('messages', [])
+    conversation_id = data.get('id')
+    print(f"Conversation ID: {conversation_id}")
+    print(f"Number of messages: {len(messages)}")
+    
+    if not messages:
+        print("Error: No messages provided")
+        return Response(f"data: {json.dumps({'error': {'message': 'No messages provided'}})}\n\n", mimetype='text/event-stream')
+        
+    # Get the last message from the conversation
+    last_message = messages[-1]
+    chat_message = last_message.get('content', '')
+    print(f"Last message content: {chat_message}")
+    
+    # Convert messages to chat history format
+    chat_history = [msg.get('content', '') for msg in messages[:-1]]  # Exclude the last message
+    print(f"Chat history length: {len(chat_history)}")
+    print(f"Chat history: {json.dumps(chat_history, indent=2)}")
+    
     if not chat_message:
-        return jsonify({"error": "No chat message provided"}), 400
+        print("Error: No chat message content found")
+        return Response(f"data: {json.dumps({'error': {'message': 'No chat message provided'}})}\n\n", mimetype='text/event-stream')
 
+    print("\n=== Analyzing Intent ===")
     intent = analyze_intent(chat_message, chat_history)
+    print(f"Detected intent: {intent}")
 
     if intent == 'backtest':
+        print("\n=== Processing Backtest Request ===")
+        print("Running backtest command...")
         result, images = run_backtest_command(chat_message, chat_history, conversation_id)
+        print("Backtest completed, uploading results...")
         res = upload_backtest_result(result, images, conversation_id)
+        print(f"Upload result: {res}")
         
         # Stream the backtest summary
+        print("\n=== Streaming Backtest Summary ===")
         prompt_template = """
         You are an expert in quantitative finance and trading strategy backtesting.
         Please provide a clear, concise summary of the following backtest results:
@@ -645,22 +730,26 @@ def chat_stream_endpoint():
 
         Keep the summary professional but easy to understand.
         """
+        print("Starting stream response...")
         return Response(
             stream_llm_response(
                 prompt_template,
                 {"backtest_results": None},
                 {"backtest_results": json.loads(result.to_json())}
             ),
-            mimetype='text/plain'
+            mimetype='text/event-stream'
         )
         
     elif intent == 'question':
-        # Stream the answer to the backtest question
+        print("\n=== Processing Backtest Question ===")
+        print(f"Fetching backtest results for conversation ID: {conversation_id}")
         response = supabase.table("backtest_results").select("*").eq("conversation_id", conversation_id).execute()
         if not response.data:
-            return Response(f"No backtest results found for conversation ID {conversation_id}.", mimetype='text/plain')
+            print(f"No backtest results found for conversation ID: {conversation_id}")
+            return Response(f"data: {json.dumps({'error': {'message': f'No backtest results found for conversation ID {conversation_id}'}})}\n\n", mimetype='text/event-stream')
             
         backtest_result = response.data[0]
+        print("Found backtest results, preparing details...")
         details = (
             f"Results: {backtest_result.get('results')}\n"
             f"Equity Curve: {backtest_result.get('equity_curve')}\n"
@@ -678,16 +767,17 @@ def chat_stream_endpoint():
         
         Provide a clear and concise answer that refers to performance metrics, trade details, or equity curve insights as appropriate.
         """
+        print("Starting stream response for question...")
         return Response(
             stream_llm_response(
                 prompt_template,
                 {"backtest_details": None, "chat_message": None},
                 {"backtest_details": details, "chat_message": chat_message}
             ),
-            mimetype='text/plain'
+            mimetype='text/event-stream'
         )
     else:
-        # Stream the conversation response
+        print("\n=== Processing General Conversation ===")
         prompt_template = """
         You are a friendly, knowledgeable chatbot with expertise in quantitative finance and backtesting.
         You are having a natural, engaging conversation with a user.
@@ -698,13 +788,14 @@ def chat_stream_endpoint():
 
         Please provide a helpful and clear response in plain text.
         """
+        print("Starting stream response for conversation...")
         return Response(
             stream_llm_response(
                 prompt_template,
                 {"conversation_id": None, "chat_history": None, "chat_message": None},
                 {"conversation_id": conversation_id, "chat_history": chat_history, "chat_message": chat_message}
             ),
-            mimetype='text/plain'
+            mimetype='text/event-stream'
         )
 
 if __name__ == '__main__':
