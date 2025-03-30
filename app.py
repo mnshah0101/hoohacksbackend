@@ -579,6 +579,13 @@ def chat_endpoint():
                 return
                 
             backtest_result = response.data[0]
+            images = {
+                "equity_curve_image": backtest_result.get('equity_curve_image'),
+                "trade_return_histogram": backtest_result.get('trade_return_histogram'),
+                "trade_duration_vs_return": backtest_result.get('trade_duration_vs_return'),
+                "drawdown_curve": backtest_result.get('drawdown_curve')
+            }
+            backtest_result['images'] = images
             print("Found backtest results, preparing details...")
             details = (
                 f"Results: {backtest_result.get('results')}\n"
@@ -596,7 +603,7 @@ def chat_endpoint():
             Based on the above information, please answer the following question:
             {chat_message}
             
-            Provide a clear and concise answer that refers to performance metrics, trade details, or equity curve insights as appropriate.
+            Provide a clear and concise answer that refers to performance metrics, trade details, or equity curve insights as appropriate. Provide image links in your response when relevant.
             """
             
             llm = ChatAnthropic(api_key=AppConfig.ANTHROPIC_API_KEY, model="claude-3-5-haiku-20241022")
